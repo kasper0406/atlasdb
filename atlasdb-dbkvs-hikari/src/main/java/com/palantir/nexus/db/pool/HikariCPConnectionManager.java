@@ -63,10 +63,10 @@ public class HikariCPConnectionManager extends BaseConnectionManager {
     }
 
     private static class State {
-        public final StateType type;
-        public final HikariDataSource dataSourcePool;
-        public final HikariPoolMXBean poolProxy;
-        public final Throwable closeTrace;
+        final StateType type;
+        final HikariDataSource dataSourcePool;
+        final HikariPoolMXBean poolProxy;
+        final Throwable closeTrace;
 
         public State(StateType type, HikariDataSource dataSourcePool, HikariPoolMXBean poolProxy, Throwable closeTrace) {
             this.type = type;
@@ -86,37 +86,47 @@ public class HikariCPConnectionManager extends BaseConnectionManager {
     public Connection getConnection() throws SQLException {
         long start = System.currentTimeMillis();
         try {
-            while (true) {
-                HikariDataSource dataSourcePool = getDataSourcePool();
-                Connection conn = dataSourcePool.getConnection();
-
-                try {
-                    testConnection(conn);
-                } catch (SQLException e) {
-                    log.error("Dropping connection which failed validation", e);
-                    dataSourcePool.evictConnection(conn);
-
-                    if (System.currentTimeMillis() > start + connConfig.getCheckoutTimeout()) {
-                        // it's been long enough that had hikari been
-                        // validating internally it would have given up rather
-                        // than retry
-                        throw e;
-                    }
-
-                    continue;
-                }
-
-                return conn;
-            }
+            return acquirePooledConnection(start);
         } finally {
-            long now = System.currentTimeMillis();
-            long elapsed = now - start;
-            if (elapsed > 1000) {
-                log.warn("Waited {}ms for connection", elapsed);
-                logPoolStats();
-            } else {
-                log.debug("Waited {}ms for connection", elapsed);
+            logConnectionAcquisitionTiming(start);
+        }
+    }
+
+    /**
+     * Attempts to acquire a valid database connection from the pool.
+     * @param startMillis start milliseconds
+     * @return valid pooled connection
+     * @throws SQLException if a connection cannot be acquired within the {@link ConnectionConfig#getCheckoutTimeout()}
+     */
+    private Connection acquirePooledConnection(long startMillis) throws SQLException {
+        while (true) {
+            HikariDataSource dataSourcePool = getDataSourcePool();
+            Connection conn = dataSourcePool.getConnection();
+
+            try {
+                testConnection(conn);
+                return conn;
+            } catch (SQLException e) {
+                log.error("Dropping connection which failed validation", e);
+                dataSourcePool.evictConnection(conn);
+
+                if (System.currentTimeMillis() > startMillis + connConfig.getCheckoutTimeout()) {
+                    // it's been long enough that had hikari been
+                    // validating internally it would have given up rather
+                    // than retry
+                    throw e;
+                }
             }
+        }
+    }
+
+    private void logConnectionAcquisitionTiming(long startMillis) {
+        long elapsedMillis = System.currentTimeMillis() - startMillis;
+        if (elapsedMillis > 1000) {
+            log.warn("Waited {}ms for connection", elapsedMillis);
+            logPoolStats();
+        } else {
+            log.debug("Waited {}ms for connection", elapsedMillis);
         }
     }
 
@@ -145,8 +155,7 @@ public class HikariCPConnectionManager extends BaseConnectionManager {
 
     private HikariDataSource getDataSourcePool() throws SQLException {
         while (true) {
-            // Volatile read state to see if we can get through here without
-            // locking.
+            // Volatile read state to see if we can get through here without locking.
             State stateLocal = state;
 
             switch (stateLocal.type) {
@@ -158,8 +167,7 @@ public class HikariCPConnectionManager extends BaseConnectionManager {
                             // the initialization and start over again.
                             state = normalState();
                         } else {
-                            // Someone else changed the state on us, just start
-                            // over.
+                            // Someone else changed the state on us, just start over.
                         }
                     }
                     break;
@@ -185,18 +193,13 @@ public class HikariCPConnectionManager extends BaseConnectionManager {
 
     /**
      * Test an initialized dataSourcePool by running a simple query.
+     * @param dataSourcePool data source to validate
+     * @throws SQLException if data source is invalid and cannot be used.
      */
     private void testDataSource(HikariDataSource dataSourcePool) throws SQLException {
         try {
-            Connection conn = null;
-
-            try {
-                conn = dataSourcePool.getConnection();
+            try (Connection conn = dataSourcePool.getConnection()) {
                 testConnection(conn);
-            } finally {
-                if (conn != null) {
-                    conn.close();
-                }
             }
         } catch (SQLException e) {
             logConnectionFailure();
@@ -204,18 +207,20 @@ public class HikariCPConnectionManager extends BaseConnectionManager {
         }
     }
 
-    private boolean testConnection(Connection conn) throws SQLException {
-        boolean isValid = false;
-        Statement stmt = conn.createStatement();
-        try {
-            ResultSet rs = stmt.executeQuery(connConfig.getTestQuery());
-            isValid = rs.next();
-            rs.close();
-        } finally {
-            stmt.close();
+    /**
+     * Test a database connection to determine if it is valid for use.
+     * @param connection connection to validate
+     * @throws SQLException if connection is invalid and cannot be used.
+     */
+    private void testConnection(Connection connection) throws SQLException {
+        try (Statement stmt = connection.createStatement();
+                ResultSet rs = stmt.executeQuery(connConfig.getTestQuery())) {
+            if (!rs.next()) {
+                throw new SQLException(String.format(
+                        "Connection %s could not be validated as it did not return any results for test query %s",
+                        connection, connConfig.getTestQuery()));
+            }
         }
-        isValid &= true;
-        return isValid;
     }
 
     @Override
